@@ -3,10 +3,12 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'Proxmotion',
   description: 'Multi-Tenant VPS Management Panel for Proxmox VE',
+  ignoreDeadLinks: true,
   themeConfig: {
     logo: '/logo.svg',
     nav: [
       { text: 'Guide', link: '/guide/introduction' },
+      { text: 'VM Templates', link: '/guide/templates-linux-images' },
       { text: 'Integrations', link: '/integrations/whmcs' },
       { text: 'API Reference', link: '/api/v1' },
       { text: 'Architecture (ADR)', link: '/adr/0051-snapshots-and-backups' },
@@ -23,13 +25,22 @@ export default defineConfig({
           ]
         },
         {
+          text: 'Building VM Templates',
+          items: [
+            { text: 'Linux Cloud Images', link: '/guide/templates-linux-images' },
+            { text: 'Windows Server (Sysprep/Cloudbase)', link: '/guide/templates-windows' },
+            { text: 'Custom Installer ISOs', link: '/guide/templates-iso' },
+            { text: 'FreeBSD Templates', link: '/guide/templates-freebsd' }
+          ]
+        },
+        {
           text: 'Core Features (v0.1)',
           items: [
             { text: 'SSH Keys Management', link: '/guide/ssh-keys' },
             { text: 'Snapshots Management', link: '/guide/snapshots' },
             { text: 'Backups Management', link: '/guide/backups' },
             { text: 'Usage & History', link: '/guide/usage-history' },
-            { text: 'Guest Scripts & OS Templates', link: '/guide/guest-scripts' }
+            { text: 'Guest Scripts & Lifecycle Hooks', link: '/guide/guest-scripts' }
           ]
         }
       ],
