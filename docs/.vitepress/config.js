@@ -3,6 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'Proxmotion',
   description: 'Multi-Tenant VPS Management Panel for Proxmox VE',
+  base: '/proxmotion-docs/',
   ignoreDeadLinks: true,
   themeConfig: {
     logo: '/logo.svg',
