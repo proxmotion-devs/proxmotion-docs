@@ -41,7 +41,8 @@ export default defineConfig({
             { text: 'Snapshots Management', link: '/guide/snapshots' },
             { text: 'Backups Management', link: '/guide/backups' },
             { text: 'Usage & History', link: '/guide/usage-history' },
-            { text: 'Guest Scripts & Lifecycle Hooks', link: '/guide/guest-scripts' }
+            { text: 'Guest Scripts & Lifecycle Hooks', link: '/guide/guest-scripts' },
+            { text: 'App Recipes & Marketplace', link: '/guide/app-recipes' }
           ]
         }
       ],
