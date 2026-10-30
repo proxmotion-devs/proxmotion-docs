@@ -1,0 +1,2218 @@
+openapi: 3.1.0
+info:
+  title: Proxmotion Billing API
+  version: 1.0.0
+  description: |
+    The API billing systems (WHMCS, WISECP, …) use to create and manage VPS on Proxmotion.
+    Design: docs/adr/0007 and docs/adr/0008.
+
+    - **Authentication:** `Authorization: Bearer pmx_…`. Tokens are created by an administrator
+      under *Admin → Billing systems*, have scopes and may be limited to IP addresses.
+    - **Billing systems:** every token belongs to one billing system and only sees that system's
+      servers (and their tasks); any other server answers `404` like one that does not exist.
+      Servers created with a token belong to its billing system, and `external_id` is unique
+      within it.
+    - **Asynchronous operations:** everything that changes Proxmox returns `202` with a task.
+      Poll `GET /tasks/{id}` until `status` is `succeeded` or `failed`, or receive signed
+      webhooks when tasks finish (see `webhooks`, docs/adr/0013).
+    - **Idempotency:** write requests may send `Idempotency-Key`. Repeating a request with the
+      same key returns the first answer (`Idempotent-Replayed: true`) instead of acting again.
+    - **Rate limit:** 120 requests per minute and token; 20 failed authentications per minute
+      and address.
+    - **Units:** memory and disk in MiB, traffic in bytes, port speed in Mbps.
+    - Version 1 only ever gets new fields and endpoints, never breaking changes.
+  license:
+    name: AGPL-3.0-only
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+servers:
+  - url: https://panel.example.com/api/v1
+security:
+  - bearer: []
+tags:
+  - name: Catalog
+  - name: Servers
+  - name: Tasks
+  - name: Apps
+
+paths:
+  /packages:
+    get:
+      tags: [Catalog]
+      summary: Active packages
+      description: 'Scope: `catalog:read`.'
+      operationId: listPackages
+      responses:
+        '200':
+          description: Packages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Package' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /locations:
+    get:
+      tags: [Catalog]
+      summary: Locations
+      description: 'Scope: `catalog:read`.'
+      operationId: listLocations
+      responses:
+        '200':
+          description: Locations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Location' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /os-templates:
+    get:
+      tags: [Catalog]
+      summary: Active OS templates
+      description: 'Scope: `catalog:read`. With `package`, only the templates that package''s servers may use; with `server`, the ones that server may be reinstalled with (its package, its cluster and, for a server of a billing system, active ones only). Both are optional and exclusive (docs/adr/0040).'
+      operationId: listOsTemplates
+      parameters:
+        - { name: package, in: query, required: false, schema: { type: string, format: uuid }, description: 'An active package. Cannot be combined with `server`.' }
+        - { name: server, in: query, required: false, schema: { type: string, format: uuid }, description: 'One of the billing system''s servers. Cannot be combined with `package`.' }
+      responses:
+        '200':
+          description: OS templates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/OsTemplate' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /firewall-rulesets:
+    get:
+      tags: [Catalog]
+      summary: Active firewall rule sets
+      description: 'Scope: `catalog:read`. Rule sets customers can apply to a server''s firewall (`POST /servers/{server}/firewall/ruleset`).'
+      operationId: listFirewallRulesets
+      responses:
+        '200':
+          description: Firewall rule sets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/FirewallRuleset' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /apps:
+    get:
+      tags: [Apps]
+      summary: Apps of the marketplace
+      description: |
+        Scope: `catalog:read`. Active apps (docs/adr/0015). With `os_template` and/or `package`,
+        only the apps that can be installed on a server with them; with `server` (one of the
+        token's billing system's servers), only those installable on it now. With `mode=order`,
+        the apps that can come with a new server (`app` of `POST /servers`) or a reinstall instead
+        of those installed later (docs/adr/0016 §5). Paid apps are listed too; with `server`, a paid
+        app without an entitlement is listed with `entitled: false` (docs/adr/0019).
+      operationId: listApps
+      parameters:
+        - { name: os_template, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: package, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: server, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: mode, in: query, required: false, schema: { type: string, enum: [post, order], default: post }, description: '`post`: installed later on a running server; `order`: with a new or reinstalled system.' }
+      responses:
+        '200':
+          description: Apps
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/App' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers:
+    get:
+      tags: [Servers]
+      summary: List or find servers
+      description: 'Scope: `servers:read`. 50 per page. `power_state` is not included here.'
+      operationId: listServers
+      parameters:
+        - { name: external_id, in: query, schema: { type: string }, description: Service id in the billing system }
+        - { name: external_client_id, in: query, schema: { type: string }, description: Customer id in the billing system }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ServerStatus' } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: A page of servers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, links, meta]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Server' } }
+                  links: { type: object }
+                  meta:
+                    type: object
+                    properties:
+                      current_page: { type: integer }
+                      last_page: { type: integer }
+                      per_page: { type: integer }
+                      total: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [Servers]
+      summary: Create a server
+      description: |
+        Scope: `servers:write`. Resources come from the package; `resources` may override them
+        (configurable options). Without a package (custom resources), `resources` must give
+        `cpu_cores`, `memory_mib` and `disk_mib` (one IPv4 address unless given) and
+        `network_model` is required. Placement, VMID and addresses are reserved before the answer; the
+        installation runs as a task. The initial root password is fetched once with
+        `GET /servers/{id}/password`.
+      operationId: createServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateServer' }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: |
+            Invalid request (`errors` per field), or the server cannot be placed (`message` only:
+            no capacity, no free addresses, template missing in the location).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /servers/{server}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: Show a server
+      description: 'Scope: `servers:read`. Includes the live `power_state` of active servers.'
+      operationId: showServer
+      responses:
+        '200':
+          description: The server
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Server' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Servers]
+      summary: Terminate a server
+      description: |
+        Scope: `servers:write`. Deletes the VM and its disks and releases the addresses. The
+        server stays visible with status `terminated`. Allowed for `active`, `suspended` and
+        `error` servers.
+      operationId: terminateServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/suspend:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Suspend an active server
+      description: |
+        Scope: `servers:write`. Shuts the VM down and keeps it stopped.
+
+        A server Proxmotion suspended itself over its traffic quota or a usage limit
+        (`suspension_cause` set, docs/adr/0039) answers `200` with the server instead: no task runs,
+        and the suspension becomes the billing system's (`suspension_cause` null, `reason` stored when
+        given), so Proxmotion never unsuspends it by itself.
+      operationId: suspendServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: [string, 'null'], maxLength: 255, description: Shown to administrators }
+      responses:
+        '200':
+          description: The server was already suspended by Proxmotion; the suspension is now the billing system's.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Server' }
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/unsuspend:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Unsuspend a suspended server
+      description: 'Scope: `servers:write`. Starts the VM again.'
+      operationId: unsuspendServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/power:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Power action
+      description: |
+        Scope: `servers:write`. Active servers only. `shutdown` asks the guest and is never
+        forced (the task fails after 3 minutes if the guest ignores it; use `stop`). `reboot`
+        of a stopped VM starts it. Actions that match the current state do nothing.
+      operationId: powerServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [start, shutdown, stop, reboot] }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/reinstall:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Reinstall the operating system
+      description: |
+        Scope: `servers:write`. Active servers only. **Wipes the disks**; ask the customer to
+        confirm first. VMID, addresses and MAC address stay the same. A new root password is
+        generated and can be fetched once with `GET /servers/{id}/password`.
+
+        The server's package (or the server itself) may limit how often it is reinstalled through
+        the API within a rolling window of days (docs/adr/0045); `reinstalls` on `GET /servers/{id}`
+        says how many remain. Over the limit the answer is `409` with `error: reinstall_limit_reached`
+        and `available_at`, and nothing changes. Failed reinstalls and administrators' reinstalls do
+        not count.
+      operationId: reinstallServer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [os_template]
+              properties:
+                os_template: { type: string, format: uuid, description: 'An OS template available on the server''s cluster, which its package allows (docs/adr/0040)' }
+                ssh_keys:
+                  allOf: [{ $ref: '#/components/schemas/SshKeys' }]
+                  description: 'The new system''s keys. Left out (or null): the server keeps its keys (`GET /servers/{server}/ssh-keys`); an empty list removes them (docs/adr/0049).'
+                app: { $ref: '#/components/schemas/OrderedApp' }
+                app_inputs: { $ref: '#/components/schemas/OrderedAppInputs' }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Not possible in the server's current status, another task is still running, a request with
+            the same Idempotency-Key is still being processed, or the reinstall limit is reached
+            (`error: reinstall_limit_reached`).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+                  error: { type: string, enum: [reinstall_limit_reached], description: Only when the reinstall limit is reached }
+                  available_at: { type: [string, 'null'], format: date-time, description: 'When the next reinstall is possible; null for a limit of 0 (no reinstalls through the API)' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/package:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Change resources (upgrade or downgrade)
+      description: |
+        Scope: `servers:write`. Active servers only. `package` absent keeps the server's package,
+        `null` makes its resources custom, an id switches to that package. Values not given come
+        from the new package, otherwise from the server's current resources.
+
+        - CPU and memory of a running server take effect at its next restart through Proxmotion
+          (`POST /servers/{id}/power` with `start` or `reboot`); until then the server shows
+          `reboot_required: true`. Send `reboot: true` to restart it right away.
+        - The disk only grows: a smaller `disk_mib` keeps the current size. The file system grows
+          at the next boot.
+        - Additional addresses come from the location's IP pools; with fewer addresses the
+          newest ones are released (with their PTRs). The primary address of each IP version
+          always stays.
+        - The server stays on its node: `422` when the node lacks capacity or no addresses are
+          free. The network model does not change.
+      operationId: changeServerResources
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                package: { type: [string, 'null'], format: uuid }
+                resources:
+                  type: [object, 'null']
+                  properties:
+                    cpu_cores: { type: integer, minimum: 1, maximum: 512 }
+                    memory_mib: { type: integer, minimum: 128, maximum: 4194304 }
+                    disk_mib: { type: integer, minimum: 1024, maximum: 67108864 }
+                    ipv4_count: { type: integer, minimum: 0, maximum: 64 }
+                    ipv6_count: { type: integer, minimum: 0, maximum: 64, description: Skipped (no IPv6 addresses) when the location has no active IPv6 pool for the network model; an IPv6 pool that has run out fails the request. }
+                    port_speed_mbps: { type: integer, minimum: 1, maximum: 400000 }
+                    traffic_bytes: { type: integer, minimum: 1 }
+                    snapshot_slots: { type: integer, minimum: 0, maximum: 100, description: "How many snapshots it may have (docs/adr/0051); 0: none" }
+                    backup_slots: { type: integer, minimum: 0, maximum: 100, description: How many backups it may have; 0: none }
+                reboot: { type: boolean, default: false }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Invalid request (`errors` per field), or not enough capacity or free addresses (`message` only).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+
+  /servers/{server}/hostname:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Change the hostname
+      description: |
+        Scope: `servers:write`. Active servers only. The hostname changes in Proxmotion at once;
+        PTRs of the server's addresses that equal the old hostname follow it. A task renames the
+        system inside the server through the guest agent (Linux: immediately). Windows uses only the
+        first label (at most 15 characters) and applies it at the next restart: with `reboot: true`
+        the server is restarted now, otherwise it shows `reboot_required: true`. The Proxmox VM keeps
+        its old name until a reinstall.
+      operationId: changeServerHostname
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hostname]
+              properties:
+                hostname: { type: string, maxLength: 253, examples: [web2.example.com] }
+                reboot: { type: boolean, default: false }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Invalid hostname (`errors`), or the server already has this name (`message`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+
+  /servers/{server}/primary-address:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Change the primary address
+      description: |
+        Scope: `servers:write`. Active servers only. Makes another address the primary one of its
+        IP version (the address the server sends from, `primary: true` in `addresses`). The number
+        of addresses never changes:
+
+        - `address` is one of the server's additional addresses: it becomes the primary and the
+          old primary becomes an additional address.
+        - `address` is a free address of the location's pools (same network model, bridge and
+          VLAN), or `address` is left out and `ip_version` given for the next free one: it becomes
+          the primary and the old primary is released (with its PTR).
+
+        The change is applied inside the server through the guest agent, without a restart;
+        cloud-init's settings stay as they are (a reinstall uses the new primary). `422` when the
+        address is not usable or none is free.
+      operationId: changeServerPrimaryAddress
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                address: { type: [string, 'null'], description: IPv4 or IPv6 address }
+                ip_version: { type: [integer, 'null'], enum: [4, 6, null], description: Required without `address` }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Invalid request (`errors` per field), or the address cannot be used (`message` only).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+
+  /servers/{server}/password:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Reset the root password
+      description: |
+        Scope: `servers:write`. Active servers only. Sets the root password through the QEMU guest
+        agent: the one given in `root_password` (chosen by the customer in the billing system), or
+        a random one that can be fetched once with `GET`. A chosen password is kept only until the
+        task has used it and is never handed out again.
+      operationId: resetServerPassword
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                root_password: { type: [string, 'null'], minLength: 12, maxLength: 128, description: 'Empty: a random password.' }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Servers]
+      summary: Fetch the current root password once
+      description: |
+        Scope: `servers:secrets`. Returns the initial or newly reset root password the first time
+        it is asked for (see `root_password_available`), `410` afterwards. Do not store it in the
+        billing system longer than needed to show it to the customer.
+      operationId: fetchServerPassword
+      responses:
+        '200':
+          description: The password
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [root_password]
+                    properties:
+                      root_password: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: Already fetched; reset it to get a new one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /servers/{server}/rdns:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Set or remove the reverse DNS of an address
+      description: |
+        Scope: `servers:write`. Active servers only, and only their own public addresses. An
+        empty `hostname` removes the PTR. Pools may require the hostname to resolve to the
+        address first. Publishing to DNS happens shortly after the answer.
+      operationId: setServerRdns
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: { type: string, examples: ['203.0.113.10'] }
+                hostname: { type: [string, 'null'], maxLength: 253, examples: [mail.example.com] }
+      responses:
+        '200':
+          description: The PTR the panel now has for the address
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [address, ptr]
+                    properties:
+                      address: { type: string }
+                      ptr: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/firewall:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: The server's firewall
+      description: |
+        Scope: `servers:read`. The inbound rules in order, which always apply; what happens to
+        incoming traffic no rule matches (`default_policy`: `accept` or `drop`); and the ports the
+        server's apps open while it drops by default. Outgoing traffic is never filtered.
+      operationId: getServerFirewall
+      responses:
+        '200':
+          description: The firewall
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Firewall' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Servers]
+      summary: Set the default policy and replace the rules
+      description: |
+        Scope: `servers:write`. Active and suspended servers. `rules` replaces every rule (at most
+        50, in order). Switched to `drop` without a rule that allows anything, the server gets one
+        rule letting SSH (Linux) or RDP (Windows) in. Answers `202` with the `apply_firewall` task.
+      operationId: updateServerFirewall
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [default_policy, rules]
+              properties:
+                default_policy: { type: string, enum: [accept, drop], description: What happens to incoming traffic no rule matches. }
+                rules: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/FirewallRule' } }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/firewall/ruleset:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Apply a firewall rule set
+      description: |
+        Scope: `servers:write`. Its rules and default policy replace the server's (`replace`), or
+        its rules follow the server's (`append`, at most 50 rules in all; the default policy stays).
+        Answers `202` with the `apply_firewall` task.
+      operationId: applyServerFirewallRuleset
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ruleset, mode]
+              properties:
+                ruleset: { type: string, format: uuid, description: 'An active rule set from `GET /firewall-rulesets`.' }
+                mode: { type: string, enum: [replace, append] }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/ssh-keys:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: The server's SSH keys
+      description: |
+        Scope: `servers:read`. The public keys Proxmotion manages for root (Windows: Administrator)
+        on the server: those of its creation or last reinstall and those added since (docs/adr/0049).
+        Keys added inside the server by its owner are not listed.
+      operationId: getServerSshKeys
+      responses:
+        '200':
+          description: The keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [ssh_keys, max_keys]
+                    properties:
+                      ssh_keys: { type: array, items: { $ref: '#/components/schemas/SshKey' } }
+                      max_keys: { type: integer, description: "How many keys a server can have (Panel settings, 1–100, 20 by default)." }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Servers]
+      summary: Replace the server's SSH keys
+      description: |
+        Scope: `servers:write`. Active servers only (the guest agent writes the keys). `ssh_keys` is
+        the whole new list: send the current keys with a new one to add it, without one to delete it,
+        an empty list to remove them all. Keys missing from it are removed from the server's
+        `authorized_keys`; other lines there stay. Answers `202` with the `change_ssh_keys` task; the
+        list changes once it succeeded, so after a failed task the same list can be sent again.
+      operationId: updateServerSshKeys
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ssh_keys]
+              properties:
+                ssh_keys:
+                  type: array
+                  maxItems: 100
+                  description: 'OpenSSH public keys (ed25519, ECDSA or RSA of 2048 bits or more); duplicates are dropped. At most `max_keys` keys (set on the panel''s Panel settings, 20 by default) of at most 20 KB together.'
+                  items: { type: string, maxLength: 16384, examples: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@example.com'] }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/snapshots:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: The server's snapshots
+      description: |
+        Scope: `servers:read`. Snapshots of the server's disk and configuration, without RAM
+        (docs/adr/0051), oldest first. They live on the server's own storage: a reinstall or a
+        termination deletes them, and the disk cannot grow while there are any.
+      operationId: getServerSnapshots
+      responses:
+        '200':
+          description: The snapshots
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [snapshots, slots, unavailable_reason]
+                    properties:
+                      snapshots: { type: array, items: { $ref: '#/components/schemas/Snapshot' } }
+                      slots: { type: integer, description: 'How many it may have (`resources.snapshot_slots`); 0: none.' }
+                      unavailable_reason: { type: [string, 'null'], description: 'Why it cannot take snapshots at all (none in its plan, or its storage does not take them), in the language of the request; null when it can.' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Servers]
+      summary: Take a snapshot
+      description: |
+        Scope: `servers:write`. Active servers only. Answers `202` with the `create_snapshot` task;
+        the snapshot is listed once it succeeded. `409` with `error: snapshot_slots_full` when the
+        server has as many as it may; `422` with `error: snapshots_not_supported` when it cannot
+        have any.
+      operationId: createServerSnapshot
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: [string, 'null'], maxLength: 64, description: The customer's name for it; no control characters }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/snapshots/{snapshot}/rollback:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - { name: snapshot, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Servers]
+      summary: Roll the server back to a snapshot
+      description: |
+        Scope: `servers:write`. Active servers only; destructive, so ask the customer to confirm.
+        The disk and configuration go back to the snapshot, then Proxmotion writes its own state
+        back: resources, port speed, disk size, firewall, and inside the server its addresses,
+        hostname and SSH keys. A running server is started again; a stopped one stays stopped and gets its addresses, hostname and SSH keys when it is next started through Proxmotion. The root password is the one
+        of the snapshot's time, so `GET /servers/{id}/password` no longer has one. Apps installed
+        since the snapshot are removed. Answers `202` with the `rollback_snapshot` task; webhook
+        `server.restored` when it succeeded.
+      operationId: rollbackServerSnapshot
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/snapshots/{snapshot}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - { name: snapshot, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [Servers]
+      summary: Delete a snapshot
+      description: |
+        Scope: `servers:write`. Active and suspended servers. Answers `202` with the
+        `delete_snapshot` task; the snapshot leaves the list once it succeeded.
+      operationId: deleteServerSnapshot
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/backups:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: The server's backups
+      description: |
+        Scope: `servers:read`. Full copies of the server made by Proxmox (vzdump) on backup storage
+        (docs/adr/0051 §4), oldest first. They survive reinstalls and are deleted with the server
+        when it is terminated. A backup belongs to its server and can only be restored onto it;
+        after the server moved to another node or cluster, a backup it can no longer reach is
+        listed with `restorable: false` and the reason.
+      operationId: getServerBackups
+      responses:
+        '200':
+          description: The backups
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [backups, slots, unavailable_reason]
+                    properties:
+                      backups: { type: array, items: { $ref: '#/components/schemas/Backup' } }
+                      slots: { type: integer, description: 'How many it may have (`resources.backup_slots`); 0: none.' }
+                      unavailable_reason: { type: [string, 'null'], description: 'Why it cannot take backups at all (none in its plan, or no backup storage its node reaches), in the language of the request; null when it can.' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Servers]
+      summary: Take a backup
+      description: |
+        Scope: `servers:write`. Active servers only; the server keeps running. Answers `202` with
+        the `create_backup` task, which may take hours on large servers; meanwhile the server takes
+        no other operation (`409`). The backup is listed once the task succeeded. `409` with
+        `error: backup_slots_full` when the server has as many as it may; `422` with
+        `error: backups_not_supported` when its plan has none, `error: no_backup_storage` when no
+        backup storage is available to it.
+      operationId: createServerBackup
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: [string, 'null'], maxLength: 64, description: The customer's name for it; no control characters }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/backups/{backup}/restore:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - { name: backup, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Servers]
+      summary: Restore a backup onto the server
+      description: |
+        Scope: `servers:write`. Active servers only; destructive, so ask the customer to confirm.
+        The server's disks and snapshots are replaced by the backup, then Proxmotion writes its own
+        state back: resources, port speed, disk size, firewall, and inside the server its
+        addresses, hostname and SSH keys. A running server is started again; a stopped one stays
+        stopped and gets its addresses, hostname and SSH keys when it is next started through
+        Proxmotion. The server's operating system becomes the backup's, and its root password the
+        one of the backup's time, so `GET /servers/{id}/password` no longer has one. Apps installed
+        since the backup are removed. Answers `202` with the `restore_backup` task; webhook
+        `server.restored` when it succeeded. `409` with `error: backup_not_restorable` when the
+        server can no longer reach the backup (see `restorable`).
+      operationId: restoreServerBackup
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/backups/{backup}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - { name: backup, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [Servers]
+      summary: Delete a backup
+      description: |
+        Scope: `servers:write`. Active and suspended servers. Answers `202` with the
+        `delete_backup` task; the backup leaves the list once it succeeded.
+      operationId: deleteServerBackup
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/usage:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Servers]
+      summary: The server's usage over a range
+      description: |
+        Scope: `servers:read`. What the server used over the last day, week, month or year
+        (docs/adr/0050): `day` gives the 5-minute samples of the last 24 hours, `week` and `month`
+        hourly averages, `year` daily averages. Traffic comes in buckets per hour (`day`), per day
+        (`week`, `month`) or per traffic period (`year`, the last 12). Times are missing where
+        Proxmotion has no figures (the server was not running, Proxmox did not answer, before it was
+        created); break lines there. Usage is collected every 5 minutes; hours are kept 35 days,
+        days 400 days.
+      operationId: getServerUsage
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema: { type: string, enum: [day, week, month, year], default: day }
+      responses:
+        '200':
+          description: The usage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/ServerUsage' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/console:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    post:
+      tags: [Servers]
+      summary: Console link for the customer's browser
+      description: |
+        Scope: `servers:secrets`. Active servers only. Returns a signed link that works once and
+        only within 60 seconds; open it in the customer's browser (new window or tab). It opens
+        the noVNC console of this server without a panel login. Request a new link every time.
+      operationId: createConsoleLink
+      responses:
+        '201':
+          description: The link
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [url, expires_at]
+                    properties:
+                      url: { type: string, format: uri }
+                      expires_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/apps:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Apps]
+      summary: Apps installed on the server
+      description: 'Scope: `servers:read`. Newest first; `outputs` only with the `apps:secrets` scope.'
+      operationId: listServerApps
+      responses:
+        '200':
+          description: Installations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/AppInstallation' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Apps]
+      summary: Install an app
+      description: |
+        Scope: `servers:write`. Active servers only, one installation at a time per server. The
+        inputs are checked against the app's declared inputs (defaults fill in missing ones) and
+        written into the server as a file, never into a command. A short `install_app` task starts
+        the installer through the guest agent; the installation then runs on its own (minutes):
+        poll `GET /servers/{id}/apps/{installation}` until `status` is `installed` or `failed`, or
+        wait for the `app.installed` / `app.failed` webhook. `409` while another app installs or
+        when the app is already installed, `422` for invalid inputs or an app that does not fit
+        the server (OS, resources, network model).
+      operationId: installServerApp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app]
+              properties:
+                app: { type: string, description: 'The app''s `id`, e.g. `wireguard`' }
+                inputs:
+                  type: [object, 'null']
+                  additionalProperties: { type: [string, integer, boolean] }
+                  examples: [{ port: 51820 }]
+      responses:
+        '202':
+          description: The installation was queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppInstallation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Invalid inputs (`errors` under `inputs.<key>`), or the app does not fit the server (`message` only).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+
+  /servers/{server}/apps/{installation}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+    get:
+      tags: [Apps]
+      summary: An app installation
+      description: |
+        Scope: `servers:read`. Progress is read from inside the server about once a minute.
+        `outputs` (VPN profiles, generated passwords, URLs) only with the `apps:secrets` scope and
+        once `installed`; show them to the customer, do not store them in the billing system.
+      operationId: showServerApp
+      responses:
+        '200':
+          description: The installation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppInstallation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Apps]
+      summary: Uninstall an app
+      description: |
+        Scope: `servers:write`. Runs the recipe's uninstall script inside the server (docs/adr/0016) for an
+        `installed`, `failed`, `uninstall_failed` or `upgrade_failed` installation whose
+        `can_uninstall` is true. The installation becomes `uninstalling`, then `removed` (its outputs are deleted) or
+        `uninstall_failed`. Poll the run or wait for `app.uninstalled` / `app.uninstall_failed`.
+        `422` when the app has no uninstall script, `409` while another run or install is in progress.
+      operationId: uninstallServerApp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The uninstall was queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppRun' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/apps/{installation}/upgrade:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+    post:
+      tags: [Apps]
+      summary: Upgrade an installed app
+      description: |
+        Scope: `servers:write`. Upgrades an `installed` or `upgrade_failed` installation to the version
+        its `upgrade` names, with that version's upgrade script (docs/adr/0016). `inputs` holds values
+        for the inputs listed in `upgrade.inputs` (those with a default may be left out); the installed
+        values are kept and cannot be changed here. The installation becomes `upgrading`, then
+        `installed` on the new version (outputs the script wrote replace those of the same key) or
+        `upgrade_failed` on its old version, which can be upgraded again or uninstalled. Poll the run
+        or wait for `app.upgraded` / `app.upgrade_failed`. `422` when no upgrade is offered or inputs
+        are invalid, `409` while another run or install is in progress.
+      operationId: upgradeServerApp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                inputs: { type: object, additionalProperties: true, examples: [{ dns: dns.example.com }] }
+      responses:
+        '202':
+          description: The upgrade was queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppRun' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/apps/{installation}/actions/{action}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+      - name: action
+        in: path
+        required: true
+        description: The `key` of one of the installation's `actions`.
+        schema: { type: string, pattern: '^[a-z][a-z0-9_]{0,39}$', examples: [add_client] }
+    post:
+      tags: [Apps]
+      summary: Run an action of an installed app
+      description: |
+        Scope: `servers:write`. Runs an action of an `installed` app (e.g. adding or revoking a VPN
+        client) with its inputs, validated like install inputs (docs/adr/0016). One run at a time per
+        installation (`409`). Its outputs belong to the run: fetch them with the `apps:secrets` scope.
+      operationId: runServerAppAction
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                inputs: { type: object, additionalProperties: true, examples: [{ name: laptop }] }
+      responses:
+        '202':
+          description: The action was queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppRun' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/apps/{installation}/runs:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+    get:
+      tags: [Apps]
+      summary: The latest uninstalls, upgrades and actions of an installation
+      description: 'Scope: `servers:read`. At most 10, newest first. `outputs` only with the `apps:secrets` scope.'
+      operationId: listServerAppRuns
+      responses:
+        '200':
+          description: The runs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/AppRun' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /servers/{server}/apps/{installation}/runs/{run}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+      - name: run
+        in: path
+        required: true
+        description: The run's `id` (UUID).
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Apps]
+      summary: An uninstall, upgrade or action run
+      description: |
+        Scope: `servers:read`. Progress is read from inside the server about once a minute. `outputs`
+        only with the `apps:secrets` scope and once `succeeded`; show them, do not store them.
+      operationId: showServerAppRun
+      responses:
+        '200':
+          description: The run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppRun' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /servers/{server}/apps/{installation}/retry:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+    post:
+      tags: [Apps]
+      summary: Retry a failed installation
+      description: 'Scope: `servers:write`. Runs a `failed` installation again with the same inputs; `409` for other statuses.'
+      operationId: retryServerApp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The installation was queued again.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppInstallation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/apps/{installation}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+    post:
+      tags: [Apps]
+      summary: Cancel a running installation
+      description: |
+        Scope: `servers:write`. Stops an `installing` installation (docs/adr/0030): it becomes `failed`
+        at once with the error "Cancelled by the billing system." (`app.failed` is sent) and its installer
+        is stopped inside the server in the background. Nothing the installer did is undone; the
+        installation can be retried or uninstalled. `409` for other statuses, also a `queued` one.
+      operationId: cancelServerApp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The installation was cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppInstallation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/apps/{installation}/runs/{run}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - $ref: '#/components/parameters/Installation'
+      - name: run
+        in: path
+        required: true
+        description: The run's `id` (UUID).
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Apps]
+      summary: Cancel a running uninstall, upgrade or action
+      description: |
+        Scope: `servers:write`. Stops a `running` run (docs/adr/0030): it becomes `failed` at once with the
+        error "Cancelled by the billing system." and the script is stopped inside the server in the
+        background. A cancelled uninstall leaves the installation `uninstall_failed`, a cancelled upgrade
+        `upgrade_failed` on its old version; the usual `app.*_failed` webhook is sent. `409` for other
+        statuses, also a `queued` run.
+      operationId: cancelServerAppRun
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The run was cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AppRun' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /servers/{server}/app-entitlements:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+    get:
+      tags: [Apps]
+      summary: Rights to paid apps on a server
+      description: 'Scope: `servers:read`. Active and revoked entitlements (docs/adr/0019), at most 50, newest first.'
+      operationId: listServerAppEntitlements
+      responses:
+        '200':
+          description: The entitlements
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/AppEntitlement' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Apps]
+      summary: Grant the right to install a paid app
+      description: |
+        Scope: `servers:write`. Call it when the customer has bought a paid app for the service,
+        e.g. when its addon is activated (docs/adr/0019). Idempotent: when the server already has an
+        active entitlement to the app, that one is returned with `200` (its `reference` unchanged).
+        Ordering a server with a paid app grants one automatically. Free apps answer `422`.
+      operationId: grantServerAppEntitlement
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app]
+              properties:
+                app: { type: string, description: The app's `id` from `GET /apps`, examples: [cpanel] }
+                reference: { type: [string, 'null'], maxLength: 191, description: 'Your own id for it, e.g. the addon id; shown to administrators.' }
+      responses:
+        '200':
+          description: The server already had an active entitlement
+          content:
+            application/json:
+              schema: { type: object, required: [data], properties: { data: { $ref: '#/components/schemas/AppEntitlement' } } }
+        '201':
+          description: Granted
+          content:
+            application/json:
+              schema: { type: object, required: [data], properties: { data: { $ref: '#/components/schemas/AppEntitlement' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /servers/{server}/app-entitlements/{app}:
+    parameters:
+      - $ref: '#/components/parameters/Server'
+      - name: app
+        in: path
+        required: true
+        description: The app's `id`.
+        schema: { type: string }
+    delete:
+      tags: [Apps]
+      summary: Revoke the right to install a paid app
+      description: |
+        Scope: `servers:write`. Call it when the customer's purchase ends, e.g. the addon is cancelled
+        or terminated. Only stops new installs, retries and reinstalls with the app: an installed app
+        stays, and its uninstall and actions keep working. `404` when the server has no active
+        entitlement to the app (already revoked counts as done).
+      operationId: revokeServerAppEntitlement
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema: { type: object, required: [data], properties: { data: { $ref: '#/components/schemas/AppEntitlement' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tasks/{task}:
+    parameters:
+      - name: task
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Tasks]
+      summary: Task status
+      description: 'Scope: `servers:read`. Poll every few seconds while `status` is `queued` or `running`.'
+      operationId: showTask
+      responses:
+        '200':
+          description: The task
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: 'An API token: `pmx_` followed by 48 characters.'
+
+  parameters:
+    Server:
+      name: server
+      in: path
+      required: true
+      description: The server's `id` (UUID). Find it by service id with `GET /servers?external_id=`.
+      schema: { type: string, format: uuid }
+    Installation:
+      name: installation
+      in: path
+      required: true
+      description: The installation's `id` (UUID).
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        1–255 visible ASCII characters, unique per operation (e.g. `whmcs-service-123-create`).
+        Kept for 24 hours per token. Same key and same request: the first answer is returned
+        again. Same key and another request: `422`. First request still running: `409`.
+        Server errors (`5xx`) are not kept, so the request may be retried with the same key.
+      schema: { type: string, minLength: 1, maxLength: 255 }
+
+  responses:
+    TaskAccepted:
+      description: The operation was queued.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: { $ref: '#/components/schemas/Task' }
+    Unauthenticated:
+      description: Missing, unknown, revoked or expired token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The token lacks the scope, or may not be used from this address.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such server or task.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        Not possible in the server's current status, another task is still running for the
+        server, or a request with the same Idempotency-Key is still being processed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: The request is invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ValidationError' }
+    TooManyRequests:
+      description: Rate limit reached; see `Retry-After`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: Proxmox could not be reached. Try again later.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+    ValidationError:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+    NetworkModel:
+      type: string
+      enum: [bridged, routed, nat]
+      description: '`nat` is not supported yet.'
+    ServerStatus:
+      type: string
+      enum: [pending, provisioning, active, suspended, reinstalling, terminating, terminated, error]
+    SshKeys:
+      type: array
+      maxItems: 100
+      items: { type: string, maxLength: 16384 }
+      description: 'OpenSSH public keys (ed25519, ECDSA, RSA ≥ 2048 bits; no DSA). An item may hold several lines. At most as many keys as `max_keys` of `GET /servers/{server}/ssh-keys` (Panel settings, 20 by default), of at most 20 KB together.'
+    Snapshot:
+      type: object
+      required: [id, label, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: [string, 'null'] }
+        created_at: { type: [string, 'null'], format: date-time }
+    Backup:
+      type: object
+      required: [id, kind, label, size_bytes, os_template, created_at, restorable, unrestorable_reason]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [manual, scheduled], description: 'Taken on request, or by a backup schedule (later).' }
+        label: { type: [string, 'null'] }
+        size_bytes: { type: [integer, 'null'] }
+        os_template: { type: [string, 'null'], description: "The name of the server's OS template when it was taken; a restore brings that system back." }
+        created_at: { type: [string, 'null'], format: date-time }
+        restorable: { type: boolean, description: "Whether the server's node can reach the backup's storage." }
+        unrestorable_reason: { type: [string, 'null'], description: 'Why it cannot be restored, in the language of the request; null when it can.' }
+    ServerUsage:
+      type: object
+      required: [range, interval_seconds, from, to, points, traffic, current]
+      properties:
+        range: { type: string, enum: [day, week, month, year] }
+        interval_seconds: { type: integer, description: 'The time each point covers: 300, 3600 or 86400.' }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        points:
+          type: array
+          description: Oldest first; each point covers `interval_seconds` from `time`.
+          items:
+            type: object
+            required: [time, cpu_percent, memory_percent, net_in_rate, net_out_rate, disk_read_rate, disk_write_rate, in_bytes, out_bytes]
+            properties:
+              time: { type: string, format: date-time }
+              cpu_percent: { type: [number, 'null'], description: Average share of the server's vCPUs }
+              memory_percent: { type: [number, 'null'], description: Average share of its memory as Proxmox reports it }
+              net_in_rate: { type: [number, 'null'], description: Average bytes per second received }
+              net_out_rate: { type: [number, 'null'], description: Average bytes per second sent }
+              disk_read_rate: { type: [number, 'null'], description: Average bytes per second read }
+              disk_write_rate: { type: [number, 'null'], description: Average bytes per second written }
+              in_bytes: { type: integer, description: Received within the point }
+              out_bytes: { type: integer, description: Sent within the point }
+        traffic:
+          type: object
+          required: [interval, buckets]
+          properties:
+            interval: { type: string, enum: [hour, day, period] }
+            buckets:
+              type: array
+              description: Oldest first; only buckets with figures.
+              items:
+                type: object
+                required: [start, end, in_bytes, out_bytes, counted_bytes]
+                properties:
+                  start: { type: string, format: date-time }
+                  end: { type: string, format: date-time }
+                  in_bytes: { type: integer }
+                  out_bytes: { type: integer }
+                  counted_bytes: { type: integer, description: 'What counts against the quota: in + out, out or in, as set in the panel' }
+        current:
+          type: object
+          description: The current traffic period, like `traffic` of the server, with its quota.
+          required: [period_start, period_end, in_bytes, out_bytes, counted_bytes, quota_bytes]
+          properties:
+            period_start: { type: string, format: date-time }
+            period_end: { type: string, format: date-time }
+            in_bytes: { type: integer }
+            out_bytes: { type: integer }
+            counted_bytes: { type: integer }
+            quota_bytes: { type: [integer, 'null'], description: Null is unlimited }
+    Package:
+      type: object
+      required: [id, name, cpu_cores, memory_mib, disk_mib, ipv4_count, ipv6_count, port_speed_mbps, traffic_bytes, snapshot_slots, backup_slots, network_models]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        cpu_cores: { type: integer }
+        memory_mib: { type: integer }
+        disk_mib: { type: integer }
+        ipv4_count: { type: integer }
+        ipv6_count: { type: integer }
+        port_speed_mbps: { type: [integer, 'null'] }
+        traffic_bytes: { type: [integer, 'null'] }
+        snapshot_slots: { type: integer, description: 'How many snapshots its servers may have (docs/adr/0051); 0: none.' }
+        backup_slots: { type: integer, description: 'How many backups its servers may have; 0: none.' }
+        reinstall_limit:
+          type: [object, 'null']
+          description: 'How often its servers may be reinstalled through the API: `count` times (0: never) within the last `period_days` days; null is unlimited (docs/adr/0045).'
+          required: [count, period_days]
+          properties:
+            count: { type: integer, minimum: 0 }
+            period_days: { type: integer, minimum: 1, maximum: 365 }
+        network_models: { type: array, items: { $ref: '#/components/schemas/NetworkModel' } }
+        os_templates: { type: array, items: { type: string, format: uuid }, description: 'The OS templates its servers may use (`GET /os-templates`); empty: any (docs/adr/0040).' }
+    FirewallRule:
+      type: object
+      required: [action, protocol]
+      description: One inbound rule. `port` not for `icmp`; `any` with a port is TCP and UDP to it, without one all traffic.
+      properties:
+        action: { type: string, enum: [accept, drop] }
+        protocol: { type: string, enum: [tcp, udp, icmp, any] }
+        port: { type: [string, 'null'], pattern: '^\d{1,5}(-\d{1,5})?$', examples: ['22', '1000-2000'] }
+        source: { type: [string, 'null'], description: 'An address or CIDR; null: anywhere.', examples: ['198.51.100.0/24'] }
+        comment: { type: [string, 'null'], maxLength: 60 }
+    Firewall:
+      type: object
+      required: [default_policy, rules, app_rules]
+      properties:
+        default_policy: { type: string, enum: [accept, drop], description: What happens to incoming traffic no rule matches. }
+        rules: { type: array, items: { $ref: '#/components/schemas/FirewallRule' } }
+        app_rules:
+          type: array
+          description: Ports the server's apps open while it drops by default; not editable.
+          items:
+            type: object
+            required: [app, protocol, port]
+            properties:
+              app: { type: string, description: The app's slug. }
+              protocol: { type: string, enum: [tcp, udp] }
+              port: { type: integer }
+    SshKey:
+      type: object
+      required: [type, fingerprint, comment, public_key]
+      properties:
+        type: { type: string, examples: [ssh-ed25519] }
+        fingerprint: { type: string, examples: ['SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s'] }
+        comment: { type: string, description: The text after the key; may be empty. }
+        public_key: { type: string, description: 'The normalized line: type, key and comment.' }
+    FirewallRuleset:
+      type: object
+      required: [id, name, description, default_policy, rules]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        default_policy: { type: string, enum: [accept, drop] }
+        rules: { type: array, items: { $ref: '#/components/schemas/FirewallRule' } }
+    Location:
+      type: object
+      required: [id, name, code, country_code, generates_hostnames]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        code: { type: string }
+        country_code: { type: [string, 'null'] }
+        generates_hostnames: { type: boolean, description: 'Whether servers of this location may be ordered without a `hostname`: the location''s template then names them from their primary address and sets that name as the PTR of their primary addresses (docs/adr/0031).' }
+    OsTemplate:
+      type: object
+      required: [id, name, family, version, distribution, distribution_version, os_family]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        family: { type: string, deprecated: true, examples: [ubuntu], description: 'The slug of its operating system with the names v1 always used (`archlinux`, `opensuse`), as in an app''s `os` (docs/adr/0026). Use `distribution` and `os_family`.' }
+        version: { type: string, deprecated: true, examples: ['24.04'], description: 'The version of its operating system, as `distribution_version`.' }
+        distribution: { type: string, examples: [ubuntu, pardus], description: 'The slug of its operating system, made from the name administrators gave it (docs/adr/0026).' }
+        distribution_version: { type: string, examples: ['24.04', '23.4'], description: 'The version of its operating system, from the administrators'' list (docs/adr/0026).' }
+        os_family: { type: string, enum: [debian, rhel, suse, arch, windows, other], description: 'The family of a well-known system (like ID_LIKE in /etc/os-release); `other` for a system the panel does not know.' }
+    OrderedApp:
+      type: [string, 'null']
+      description: |
+        Optional app (its `id` from `GET /apps?mode=order`) installed through the guest agent once
+        the new system has booted (docs/adr/0016 §5). It must fit the OS template, resources and
+        network model (`422` with an error under `app` otherwise). The installation shows in
+        `GET /servers/{id}/apps` with `mode: order`; a failed install never fails the server and can
+        be retried. On a reinstall, the server's other apps are removed as always.
+      examples: [wireguard]
+    OrderedAppInputs:
+      type: [object, 'null']
+      description: Inputs of `app`, validated like those of `POST /servers/{id}/apps` (errors under `app_inputs.<key>`).
+      additionalProperties: true
+    CreateServer:
+      type: object
+      required: [external_id, location, os_template]
+      properties:
+        external_id: { type: string, maxLength: 191, description: Service id in the billing system; unique within the token's billing system }
+        external_client_id: { type: [string, 'null'], maxLength: 191, description: Customer id in the billing system }
+        package: { type: [string, 'null'], format: uuid, description: 'Empty: custom resources from `resources`.' }
+        location: { type: string, format: uuid }
+        os_template: { type: string, format: uuid }
+        network_model: { description: 'Default: the first model the package allows. Required without a package.', oneOf: [{ $ref: '#/components/schemas/NetworkModel' }, { type: 'null' }] }
+        hostname: { type: [string, 'null'], maxLength: 253, examples: [web1.example.com], description: 'Empty: named from the location''s hostname template, e.g. `ip-203-0-113-5.example.com`, which also becomes the PTR of the primary address of each version (docs/adr/0031). `422` under `hostname` when the location has none (`generates_hostnames: false`).' }
+        primary_ipv4: { type: [string, 'null'], format: ipv4, description: 'A free address of the location''s pools to use as the primary IPv4 address (the other IPv4 addresses come from its pool). Empty: the next free one. `422` when it is not free.' }
+        root_password: { type: [string, 'null'], minLength: 12, maxLength: 128, description: 'Empty: a random password.' }
+        ssh_keys: { $ref: '#/components/schemas/SshKeys' }
+        app: { $ref: '#/components/schemas/OrderedApp' }
+        app_inputs: { $ref: '#/components/schemas/OrderedAppInputs' }
+        resources:
+          type: [object, 'null']
+          description: Overrides of the package's resources; each is optional. Without a package, cpu_cores, memory_mib and disk_mib are required and ipv4_count defaults to 1.
+          properties:
+            cpu_cores: { type: integer, minimum: 1, maximum: 512 }
+            memory_mib: { type: integer, minimum: 128, maximum: 4194304 }
+            disk_mib: { type: integer, minimum: 1024, maximum: 67108864 }
+            ipv4_count: { type: integer, minimum: 0, maximum: 64 }
+            ipv6_count: { type: integer, minimum: 0, maximum: 64, description: Skipped (no IPv6 addresses) when the location has no active IPv6 pool for the network model; an IPv6 pool that has run out fails the request. }
+            port_speed_mbps: { type: integer, minimum: 1, maximum: 400000 }
+            traffic_bytes: { type: integer, minimum: 1 }
+            snapshot_slots: { type: integer, minimum: 0, maximum: 100, description: "How many snapshots it may have (docs/adr/0051); 0: none. Default: the package's." }
+            backup_slots: { type: integer, minimum: 0, maximum: 100, description: "How many backups it may have; 0: none. Default: the package's." }
+    Server:
+      type: object
+      required: [id, external_id, external_client_id, hostname, status, suspension_reason, suspension_cause, reboot_required, network_model, package, location, os_template, resources, traffic, addresses, root_password_available, created_at, provisioned_at, terminated_at]
+      properties:
+        id: { type: string, format: uuid }
+        external_id: { type: [string, 'null'] }
+        external_client_id: { type: [string, 'null'] }
+        hostname: { type: string }
+        status: { $ref: '#/components/schemas/ServerStatus' }
+        suspension_reason: { type: [string, 'null'] }
+        suspension_cause:
+          type: [string, 'null']
+          enum: [traffic, usage, null]
+          description: |
+            Set when Proxmotion suspended the server itself (docs/adr/0039): `traffic` over its traffic
+            quota (unsuspended by Proxmotion once a new period starts or the quota is raised), `usage` over
+            a usage limit (stays suspended). Null for suspensions by the billing system or an administrator.
+        reboot_required: { type: boolean, description: 'Changes wait for a restart through Proxmotion (power start or reboot): new CPU or memory, a new Windows computer name' }
+        power_state:
+          type: [string, 'null']
+          description: Only on `GET /servers/{id}`. `running`, `stopped`, …; null when the server is not active or Proxmox could not be asked.
+        reinstalls:
+          type: object
+          description: |
+            Only on `GET /servers/{id}` (docs/adr/0045). How often the server may still be reinstalled through
+            the API: `used` of `limit` within the last `period_days` days, and once none remain, when the next
+            one is possible (`available_at`, null for a limit of 0). Every field is null when unlimited.
+          required: [limit, period_days, used, remaining, available_at]
+          properties:
+            limit: { type: [integer, 'null'], minimum: 0 }
+            period_days: { type: [integer, 'null'] }
+            used: { type: [integer, 'null'] }
+            remaining: { type: [integer, 'null'] }
+            available_at: { type: [string, 'null'], format: date-time }
+        network_model: { $ref: '#/components/schemas/NetworkModel' }
+        package:
+          type: [object, 'null']
+          properties: { id: { type: string, format: uuid }, name: { type: string } }
+        location:
+          type: object
+          properties: { id: { type: string, format: uuid }, name: { type: string } }
+        os_template:
+          type: [object, 'null']
+          properties: { id: { type: string, format: uuid }, name: { type: string } }
+        resources:
+          type: object
+          required: [cpu_cores, memory_mib, disk_mib, port_speed_mbps, traffic_bytes, snapshot_slots, backup_slots]
+          properties:
+            cpu_cores: { type: integer }
+            memory_mib: { type: integer }
+            disk_mib: { type: integer }
+            port_speed_mbps: { type: [integer, 'null'] }
+            traffic_bytes: { type: [integer, 'null'], description: Monthly traffic quota; null is unlimited }
+            snapshot_slots: { type: integer, description: 'How many snapshots it may have (docs/adr/0051); 0: none' }
+            backup_slots: { type: integer, description: 'How many backups it may have; 0: none' }
+        traffic:
+          type: object
+          description: Traffic of the current period (docs/adr/0039), counted every 5 minutes.
+          required: [period_start, period_end, in_bytes, out_bytes, counted_bytes]
+          properties:
+            period_start: { type: string, format: date-time }
+            period_end: { type: string, format: date-time, description: The next period starts here }
+            in_bytes: { type: integer, description: Received by the server }
+            out_bytes: { type: integer, description: Sent by the server }
+            counted_bytes: { type: integer, description: 'What counts against the quota: in + out, out or in, as set in the panel' }
+        addresses:
+          type: array
+          items:
+            type: object
+            required: [address, version, primary, prefix, gateway, ptr]
+            properties:
+              address: { type: string }
+              version: { type: integer, enum: [4, 6] }
+              primary: { type: boolean, description: The primary address of its version; listed first }
+              prefix: { type: integer, description: As configured in the guest (routed IPv4 addresses are /32) }
+              gateway: { type: [string, 'null'] }
+              ptr: { type: [string, 'null'] }
+        root_password_available: { type: boolean, description: A new root password can be fetched once }
+        created_at: { type: [string, 'null'], format: date-time }
+        provisioned_at: { type: [string, 'null'], format: date-time }
+        terminated_at: { type: [string, 'null'], format: date-time }
+    Task:
+      type: object
+      required: [id, type, status, server, steps, error, created_at, started_at, finished_at]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [create, suspend, unsuspend, terminate, adopt, start, shutdown, stop, reboot, reset_password, reinstall, change_resources, guest_script, change_primary_address, change_addresses, change_hostname, change_ssh_keys, install_app, app_run, verify, enable_anti_spoofing, apply_firewall, move, create_snapshot, rollback_snapshot, delete_snapshot, create_backup, restore_backup, delete_backup] }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        server:
+          type: object
+          required: [id, external_id, hostname, status]
+          properties:
+            id: { type: string, format: uuid }
+            external_id: { type: [string, 'null'] }
+            hostname: { type: string, description: 'Also the name generated for a server ordered without one (docs/adr/0031).' }
+            status: { $ref: '#/components/schemas/ServerStatus' }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              status: { type: string, description: 'done, or running while a slow step (e.g. inside the guest) is in progress' }
+              message: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        created_at: { type: [string, 'null'], format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    Text:
+      type: object
+      description: A text in English (`en`) and, when the recipe has it, Turkish (`tr`).
+      required: [en]
+      properties:
+        en: { type: string }
+        tr: { type: string }
+    App:
+      type: object
+      required: [id, name, version, category, description, format, os, requires, requirements, network_models, install_modes, billing, license, inputs, outputs, can_uninstall, actions]
+      properties:
+        id: { type: string, examples: [wireguard] }
+        name: { type: string }
+        version: { type: string, examples: [1.0.0] }
+        category: { type: string, enum: [vpn, control-panel, container, web] }
+        description: { $ref: '#/components/schemas/Text' }
+        format: { type: integer, enum: [1, 2], description: 'Recipe format (docs/adr/0016).' }
+        os:
+          type: array
+          description: 'The operating system versions administrators offer the app on (docs/adr/0026), grouped by system slug (v1 names such as `archlinux`). The catalog filtered by `os_template` or `server` already applies them.'
+          items:
+            type: object
+            properties:
+              family: { type: string, examples: [ubuntu] }
+              versions: { type: array, items: { type: string }, examples: [['22.04', '24.04']] }
+        requires:
+          type: object
+          description: 'What the recipe says it runs on (docs/adr/0024 §4). Only a suggestion for administrators since docs/adr/0026: the app is offered on the versions listed in `os`.'
+          properties:
+            platform: { type: string, enum: [linux, windows] }
+            os: { type: [array, 'null'], deprecated: true, items: { type: string }, description: '`os_families` and `distributions` in one list. null: any OS of the platform.', examples: [['debian', 'almalinux']] }
+            os_families: { type: [array, 'null'], items: { type: string, enum: [debian, rhel, suse, arch, windows] }, description: 'Families (like ID_LIKE in /etc/os-release): every distribution of the family the panel knows. null together with `distributions`: any OS of the platform.', examples: [['debian']] }
+            distributions: { type: [array, 'null'], items: { type: string }, description: 'Single distributions (os-release IDs).', examples: [['almalinux', 'rocky']] }
+            min_versions: { type: object, additionalProperties: { type: string }, description: 'Lowest supported version per distribution.', examples: [{ ubuntu: '22.04' }] }
+            max_versions: { type: object, additionalProperties: { type: string }, description: 'Highest supported version per distribution; a template version is compared by as many parts as given (`12` covers `12.7`).', examples: [{ debian: '12' }] }
+        requirements:
+          type: object
+          properties:
+            min_cores: { type: integer }
+            min_memory_mib: { type: integer }
+            min_disk_mib: { type: integer }
+        network_models: { type: array, items: { $ref: '#/components/schemas/NetworkModel' } }
+        install_modes: { type: array, items: { type: string, enum: [order, post] }, description: '`order`: can come with a new server or a reinstall (`app` of `POST /servers`); `post`: can be installed later on a running server.' }
+        billing: { type: string, enum: [free, paid], description: '`paid`: installing it later needs an entitlement on the server (`POST /servers/{id}/app-entitlements`); ordering a server with it grants one (docs/adr/0019).' }
+        entitled: { type: boolean, description: 'Only with the `server` filter: whether that server may install the app now. `false` for a paid app without an entitlement (offer to buy it); free apps are always `true`.' }
+        license: { type: string, enum: [none, external], description: '`external`: the licence is sold separately.' }
+        inputs:
+          type: array
+          items:
+            type: object
+            required: [key, type, label, required, default]
+            properties:
+              key: { type: string }
+              type: { type: string, enum: [string, password, integer, port, boolean, enum, slug, email, domain, url], description: "`url`: an HTTPS address the server downloads from." }
+              label: { oneOf: [{ $ref: '#/components/schemas/Text' }, { type: 'null' }] }
+              required: { type: boolean }
+              default: { type: [string, integer, boolean, 'null'] }
+              options: { type: [array, 'null'], items: { type: string }, description: Values of an `enum` input }
+              min: { type: [integer, 'null'], description: 'Smallest number (integer, port) or shortest length (password)' }
+              max: { type: [integer, 'null'] }
+              max_length: { type: [integer, 'null'] }
+        outputs:
+          type: array
+          items:
+            type: object
+            required: [key, type, label, filename, secret]
+            properties:
+              key: { type: string }
+              type: { type: string, enum: [text, url, file] }
+              label: { oneOf: [{ $ref: '#/components/schemas/Text' }, { type: 'null' }] }
+              filename: { type: [string, 'null'] }
+              secret: { type: boolean }
+        can_uninstall: { type: boolean, description: 'The recipe has an uninstall script (docs/adr/0016).' }
+        actions:
+          type: array
+          description: Actions installed copies offer (docs/adr/0016).
+          items: { $ref: '#/components/schemas/AppAction' }
+    AppAction:
+      type: object
+      required: [key, label, inputs, outputs]
+      properties:
+        key: { type: string, examples: [add_client] }
+        label: { $ref: '#/components/schemas/Text' }
+        inputs: { $ref: '#/components/schemas/App/properties/inputs' }
+        outputs: { $ref: '#/components/schemas/App/properties/outputs' }
+    AppInstallation:
+      type: object
+      required: [id, app, server, status, mode, progress, step, error, inputs, can_uninstall, actions, upgrade, task_id, created_at, started_at, finished_at]
+      properties:
+        id: { type: string, format: uuid }
+        app:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            version: { type: string }
+        server:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            external_id: { type: [string, 'null'] }
+        status:
+          type: string
+          enum: [queued, installing, installed, failed, uninstalling, uninstall_failed, upgrading, upgrade_failed, removed]
+          description: '`removed`: uninstalled, or the server was reinstalled or terminated. `uninstall_failed`: the uninstall script failed; uninstalling can be tried again. `upgrade_failed`: the upgrade script failed; the installation keeps its old version and outputs and can be upgraded again or uninstalled.'
+        mode:
+          type: string
+          enum: [post, order]
+          description: '`post`: installed later on a running server; `order`: chosen with a new server or a reinstall and started once its guest agent answered (docs/adr/0016 §5).'
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        step: { type: [string, 'null'], description: 'What the installer is doing, as it reported it (English)' }
+        error: { type: [string, 'null'] }
+        inputs: { type: object, description: The values installed with; passwords are left out }
+        outputs:
+          type: array
+          description: Only with the `apps:secrets` scope; empty unless `installed` or `upgrade_failed`.
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              type: { type: string, enum: [text, url, file] }
+              label: { oneOf: [{ $ref: '#/components/schemas/Text' }, { type: 'null' }] }
+              secret: { type: boolean }
+              value: { type: [string, 'null'], description: Text and URL outputs }
+              filename: { type: [string, 'null'] }
+              content_base64: { type: [string, 'null'], description: File outputs }
+        can_uninstall: { type: boolean, description: '`DELETE` is possible now (docs/adr/0016).' }
+        actions:
+          type: array
+          description: Actions that can run now (only while `installed`).
+          items: { $ref: '#/components/schemas/AppAction' }
+        upgrade:
+          type: [object, 'null']
+          description: 'The version `POST ./upgrade` would move the installation to now, or `null` (docs/adr/0016): the app''s newer published version whose upgrade script accepts the installed one and that still fits the server.'
+          required: [version, inputs]
+          properties:
+            version: { type: string, examples: [1.3.0] }
+            inputs:
+              allOf: [{ $ref: '#/components/schemas/App/properties/inputs' }]
+              description: Inputs the new version adds; give values for those without a default.
+        task_id: { type: [string, 'null'], format: uuid, description: The `install_app` task of the latest attempt }
+        created_at: { type: [string, 'null'], format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    AppEntitlement:
+      type: object
+      required: [id, app, server, source, reference, active, created_at, revoked_at]
+      properties:
+        id: { type: string, format: uuid }
+        app:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+        server:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            external_id: { type: [string, 'null'] }
+        source: { type: string, enum: [order, api, admin], description: '`order`: the server was ordered with the app; `api`: granted through this API; `admin`: by an administrator.' }
+        reference: { type: [string, 'null'] }
+        active: { type: boolean, description: '`false` once revoked.' }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+    AppRun:
+      type: object
+      description: An uninstall, upgrade or action of an installed app (docs/adr/0016).
+      required: [id, installation_id, kind, action, target_version, status, progress, step, error, inputs, task_id, created_at, started_at, finished_at]
+      properties:
+        id: { type: string, format: uuid }
+        installation_id: { type: string, format: uuid }
+        kind: { type: string, enum: [uninstall, upgrade, action] }
+        action: { type: [string, 'null'], description: The action's `key` }
+        target_version: { type: [string, 'null'], description: The version an upgrade moves the installation to }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        step: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        inputs: { type: object, description: 'The action''s inputs, or the install inputs an upgrade runs with; passwords are left out' }
+        outputs:
+          allOf: [{ $ref: '#/components/schemas/AppInstallation/properties/outputs' }]
+          description: The action's outputs, only with the `apps:secrets` scope; empty until `succeeded`, always empty for uninstalls and upgrades (an upgrade's outputs go to the installation).
+        task_id: { type: [string, 'null'], format: uuid, description: The `app_run` task }
+        created_at: { type: [string, 'null'], format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    UsageViolation:
+      type: object
+      description: A server over its traffic quota or a usage limit (docs/adr/0039).
+      required: [id, kind, value, threshold, unit, window_minutes, period_start, action, started_at, acted_at, resolved_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [traffic, cpu, memory, disk, network] }
+        value: { type: number, description: 'Counted bytes (traffic), else the average over the window in `unit`' }
+        threshold: { type: number, description: 'The quota or limit in `unit`' }
+        unit: { type: string, enum: [bytes, percent, MB/s, Mbps] }
+        window_minutes: { type: [integer, 'null'] }
+        period_start: { type: [string, 'null'], format: date, description: The traffic period of a traffic violation }
+        action: { type: string, enum: [none, stop, suspend], description: What Proxmotion does about it, as set in the panel }
+        started_at: { type: [string, 'null'], format: date-time }
+        acted_at: { type: [string, 'null'], format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+    WebhookEvent:
+      type: object
+      description: |
+        Body of every webhook request. The same event has the same `id` at every endpoint and
+        when it is sent again; use it to ignore repeats.
+      required: [id, event, created_at, data]
+      properties:
+        id: { type: string, format: uuid }
+        event:
+          type: string
+          enum: [ping, server.provisioned, server.suspended, server.unsuspended, server.reinstalled, server.terminated, server.moved, server.restored, server.failed, server.usage_exceeded, task.succeeded, task.failed, app.installed, app.failed, app.uninstalled, app.uninstall_failed, app.upgraded, app.upgrade_failed, app.action_succeeded, app.action_failed]
+        created_at: { type: string, format: date-time }
+        data:
+          type: object
+          description: '`server` and `task` for server and task events, `server` and `violation` for `server.usage_exceeded`, `server` and `installation` (without outputs) for app events, plus `run` (without outputs) for uninstall, upgrade and action events, `billing_system` for `ping`.'
+          properties:
+            server:
+              type: object
+              required: [id, external_id, external_client_id, hostname, status]
+              properties:
+                id: { type: string, format: uuid }
+                external_id: { type: [string, 'null'] }
+                external_client_id: { type: [string, 'null'] }
+                hostname: { type: string }
+                status: { $ref: '#/components/schemas/ServerStatus' }
+            task: { $ref: '#/components/schemas/Task' }
+            violation: { $ref: '#/components/schemas/UsageViolation' }
+            installation: { $ref: '#/components/schemas/AppInstallation' }
+            run: { $ref: '#/components/schemas/AppRun' }
+            billing_system:
+              type: object
+              properties:
+                id: { type: string, format: uuid }
+                name: { type: string }
+
+# Requests Proxmotion sends to the webhook endpoints of a billing system (docs/adr/0013).
+webhooks:
+  serverEvent:
+    post:
+      summary: A task or app installation of one of the billing system's servers finished
+      description: |
+        Sent to every active endpoint of the server's billing system that subscribed to the event,
+        configured under *Admin → Billing systems*. Events:
+
+        - `server.provisioned`, `server.suspended`, `server.unsuspended`, `server.reinstalled`,
+          `server.terminated`: the task of that type succeeded.
+        - `server.moved`: an administrator moved the server to another node, cluster or location
+          (docs/adr/0037). After a move to another location the server has new addresses: read
+          them with `GET /servers/{id}`.
+        - `server.restored`: the server went back to a snapshot or was restored from a backup
+          (docs/adr/0051). Its root password is the one of that time: the panel no longer knows
+          it, so offer a password reset.
+        - `server.failed`: creating, reinstalling or terminating failed; the server is in `error`.
+        - `server.usage_exceeded`: the server went over its traffic quota or a usage limit
+          (docs/adr/0039), whatever Proxmotion does about it; `data` has the server and the
+          `violation`. A suspension that follows also sends `server.suspended`.
+        - `task.succeeded`, `task.failed`: any task, including power actions, password resets,
+          resource, address and hostname changes. A server event and its task event are separate
+          deliveries with different ids.
+        - `app.installed`, `app.failed`: an app installation finished (docs/adr/0015); `data` has
+          the server and the installation without its outputs.
+        - `app.uninstalled`, `app.uninstall_failed`, `app.upgraded`, `app.upgrade_failed`,
+          `app.action_succeeded`, `app.action_failed`: an uninstall, upgrade or action finished
+          (docs/adr/0016); `data` also has the `run` without outputs.
+        - `ping`: a test sent by an administrator.
+
+        Events are also sent for operations an administrator started in the panel.
+
+        **Verifying:** the `Proxmotion-Signature` header has the form `t=<unix timestamp>,v1=<hex>`,
+        where `v1` is the HMAC-SHA256 of `<t>.<raw body>` with the endpoint's signing secret
+        (`whsec_…`). Compare it in constant time and refuse timestamps older than about five
+        minutes.
+
+        **Delivery:** only a `2xx` answer within 10 seconds counts as delivered; redirects are not
+        followed. Otherwise the request is repeated after 1 min, 5 min, 30 min, 1 h, 2 h, 6 h and
+        12 h (8 attempts), then marked failed; administrators can send it again. Deliveries are at
+        least once and not necessarily in order: use `id` to ignore repeats and fetch the server or
+        task from the API when the order matters.
+      parameters:
+        - { name: Proxmotion-Webhook-Id, in: header, required: true, schema: { type: string, format: uuid }, description: The event id (same as `id` in the body). }
+        - { name: Proxmotion-Webhook-Event, in: header, required: true, schema: { type: string }, description: The event name. }
+        - { name: Proxmotion-Signature, in: header, required: true, schema: { type: string }, example: 't=1800000000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEvent' }
+      responses:
+        '2XX': { description: Received. Any other answer is retried. }

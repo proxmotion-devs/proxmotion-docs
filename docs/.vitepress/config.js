@@ -57,13 +57,11 @@ export default defineConfig({
       ],
       '/api/': [
         {
-          text: 'REST API',
+          text: 'REST API & Webhooks',
           items: [
             { text: 'Billing API v1 Overview', link: '/api/v1' },
-            { text: 'SSH Keys API', link: '/api/ssh-keys' },
-            { text: 'Snapshots API', link: '/api/snapshots' },
-            { text: 'Backups API', link: '/api/backups' },
-            { text: 'Usage API', link: '/api/usage' }
+            { text: 'Webhooks Specification', link: '/api/webhooks' },
+            { text: 'OpenAPI Specification (YAML)', link: '/openapi.yaml' }
           ]
         }
       ],
